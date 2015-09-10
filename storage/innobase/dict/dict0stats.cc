@@ -1902,7 +1902,9 @@ dict_stats_analyze_index(
 	DEBUG_PRINTF("  %s(index=%s)\n", __func__, index->name);
 
 	dict_stats_empty_index(index);
-
+	
+	DEBUG_SYNC_C("dict_stats_analyze_index_middle");
+  
 	mtr_start(&mtr);
 
 	mtr_s_lock(dict_index_get_lock(index), &mtr);

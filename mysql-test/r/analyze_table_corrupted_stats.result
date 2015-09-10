@@ -1,0 +1,47 @@
+SET @innodb_stats_auto_recalc_save = @@innodb_stats_auto_recalc;
+SET GLOBAL innodb_stats_auto_recalc = OFF;
+FLUSH STATUS;
+SET SESSION long_query_time=0;
+SET SESSION min_examined_row_limit=0;
+SET SESSION sort_buffer_size=32804;
+CREATE TABLE t1 (a INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (5), (16), (2), (17), (1);
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+ANALYZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	analyze	status	OK
+SELECT * FROM t1 ORDER BY a;
+SHOW SESSION STATUS LIKE 'Sort_merge_passes';
+Variable_name	Value
+Sort_merge_passes	4
+Connection Aux
+SET DEBUG_SYNC = 'RESET';
+SET DEBUG_SYNC = 'dict_stats_analyze_index_middle WAIT_FOR initiated';
+ANALYZE TABLE t1;
+Connection Default
+SELECT * FROM t1 ORDER BY a;
+SHOW SESSION STATUS LIKE 'Sort_merge_passes';
+Variable_name	Value
+Sort_merge_passes	8
+SET DEBUG_SYNC ='now SIGNAL initiated';
+Connection Aux
+Table	Op	Msg_type	Msg_text
+test.t1	analyze	status	OK
+Connection Default
+SET SESSION long_query_time=default;
+SET SESSION min_examined_row_limit=default;
+SET SESSION sort_buffer_size=default;
+DROP TABLE t1;
+SET GLOBAL innodb_stats_auto_recalc = @innodb_stats_auto_recalc_save;

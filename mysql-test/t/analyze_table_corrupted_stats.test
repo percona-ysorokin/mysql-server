@@ -1,0 +1,93 @@
+#
+# Test that no intermediate states during "ANALYZE TABLE" execution is exposed to other threads.
+#
+--source include/have_innodb.inc
+#--source include/have_debug_sync.inc
+
+# Disable background stats recalculation.
+SET @innodb_stats_auto_recalc_save = @@innodb_stats_auto_recalc;
+SET GLOBAL innodb_stats_auto_recalc = OFF;
+
+# Reset "Sort_merge_passes" to 0
+FLUSH STATUS;
+
+SET SESSION long_query_time=0;
+SET SESSION min_examined_row_limit=0;
+SET SESSION sort_buffer_size=32804;
+
+CREATE TABLE t1 (a INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (5), (16), (2), (17), (1);
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+INSERT INTO t1 SELECT * FROM t1;
+
+ANALYZE TABLE t1;
+
+# Execute "SELECT" statement and capture "Sort_merge_Passes" from status.
+--disable_result_log
+SELECT * FROM t1 ORDER BY a;
+--enable_result_log
+
+# Here we expect "Sort_merge_passes" to be increased by 4 (to be set to 0 + 4 = 4)
+SHOW SESSION STATUS LIKE 'Sort_merge_passes';
+
+# Initiate another connection and make "ANALYZE TABLE" stop at
+# "dict_stats_analyze_index_middle" debug sync point.
+connect (auxcon,localhost,root,,);
+
+--echo Connection Aux
+connection auxcon;
+SET DEBUG_SYNC = 'RESET';
+SET DEBUG_SYNC = 'dict_stats_analyze_index_middle WAIT_FOR initiated';
+--send ANALYZE TABLE t1
+
+# Return to primary connection and run "SELECT" statement again.
+# Then capture "Sort_merge_Passes" from status again.
+--echo Connection Default
+--sleep 2
+connection default;
+--disable_result_log
+SELECT * FROM t1 ORDER BY a;
+--enable_result_log
+
+# Here we expect "Sort_merge_passes" to be increased by 4 again (to be set to 4 + 4 = 8).
+# However, because "ANALYZE TABLE" in another connection is stopped at debug sync point,
+# stats for this table indexes were reset but have not been updated to new values yet.
+# Nevertheless, they are visible to another thread which executes
+# "SELECT * FROM t1 ORDER BY a" statement and which depends on current value of the
+# "stat_n_leaf_pages" (which was reset to 1). This gives us unexpected increase in
+# "Sort_merge_passes" (4 + 6 = 10, in this particular case).
+# we get different 
+SHOW SESSION STATUS LIKE 'Sort_merge_passes';
+
+# Resume "ANALYZE TABLE" execution in the auxiliary connection.
+SET DEBUG_SYNC ='now SIGNAL initiated';
+
+# Swithch to auxiliary connection and wait for "ANALYZE TABLE" statement to finish.
+--echo Connection Aux
+connection auxcon;
+--reap
+
+# Drop auxiliary connection.
+--echo Connection Default
+connection default;
+
+disconnect auxcon;
+
+SET SESSION long_query_time=default;
+SET SESSION min_examined_row_limit=default;
+SET SESSION sort_buffer_size=default;
+
+DROP TABLE t1;
+
+SET GLOBAL innodb_stats_auto_recalc = @innodb_stats_auto_recalc_save;
