@@ -120,8 +120,8 @@ struct Moved {
   /** Path where it was found during the scan. */
   std::string new_path;
 
-  /** Move occurred before 9.0.0 and missed to update dir flag */
-  bool before_90000;
+  /** Move occurred before 8.0.37/8.4.1/9.0.0 and missed to update dir flag */
+  bool moved_prev_or_has_datadir;
 };
 
 using Tablespaces = std::vector<Moved>;
@@ -1569,18 +1569,20 @@ class Fil_system {
   [[nodiscard]] bool check_missing_tablespaces();
 
   /** Note that a file has been relocated.
-  @param[in]    object_id       Server DD tablespace ID
-  @param[in]    space_id        InnoDB tablespace ID
-  @param[in]    space_name      Tablespace name
-  @param[in]    old_path        Path to the old location
-  @param[in]    new_path        Path scanned from disk
-  @param[in]    before_90000    The move has happened before 90000 and didn't
-                                update the DD_TABLE_DATA_DIRECTORY flag.*/
+  @param[in]    object_id                      Server DD tablespace ID
+  @param[in]    space_id                       InnoDB tablespace ID
+  @param[in]    space_name                     Tablespace name
+  @param[in]    old_path                       Path to the old location
+  @param[in]    new_path                       Path scanned from disk
+  @param[in]    moved_prev_or_has_datadir      The move has happened before
+                                               8.0.38/8.4.1/9.0.0 or table is
+                                               created with data dir clause.*/
   void moved(dd::Object_id object_id, space_id_t space_id,
              const char *space_name, const std::string &old_path,
-             const std::string &new_path, bool before_90000) {
-    m_moved.push_back(
-        {object_id, space_id, space_name, old_path, new_path, before_90000});
+             const std::string &new_path, bool moved_prev_or_has_datadir) {
+    std::lock_guard guard(m_moved_mutex);
+    m_moved.push_back({object_id, space_id, space_name, old_path, new_path,
+                       moved_prev_or_has_datadir});
   }
 
   /** Check if a path is known to InnoDB.
@@ -1767,6 +1769,9 @@ class Fil_system {
   /** List of tablespaces that have been relocated. We need to
   update the DD when it is safe to do so. */
   dd_fil::Tablespaces m_moved;
+
+  /** Mutex protecting the list of relocated tablespaces */
+  std::mutex m_moved_mutex;
 
   /** Tablespace directories scanned at startup */
   Tablespace_dirs m_dirs;
@@ -9652,13 +9657,29 @@ Free the Tablespace_files instance.
 @param[in]      read_only_mode  true if InnoDB is started in read only mode.
 @return DB_SUCCESS if all OK */
 dberr_t Fil_system::prepare_open_for_business(bool read_only_mode) {
-  if (read_only_mode && !m_moved.empty()) {
-    ib::error(ER_IB_MSG_344)
-        << m_moved.size() << " files have been relocated"
-        << " and the server has been started in read"
-        << " only mode. Cannot update the data dictionary.";
+  if (read_only_mode) {
+    for (auto &tablespace : m_moved) {
+      auto old_path = tablespace.old_path;
+      auto new_path = tablespace.new_path;
 
-    return DB_READ_ONLY;
+      /* m_moved might have 3 kinds of files
+      1. Files which are actually moved to other directory.
+      2. Files which are created with DATA DIRECTORY flag updated in DD.
+      3. Files which are moved before upgrade and don't have DATA DIRECTORY
+      flags updated in DD.
+
+      In case of [2] and [3], old_path and new_path will be equal.
+      In read only mode, we shall error out only in case of 1. */
+      if (old_path != new_path) {
+        ib::error(ER_IB_MSG_344)
+            << m_moved.size() << " files have been relocated"
+            << " and the server has been started in read"
+            << " only mode. Cannot update the data dictionary.";
+
+        return DB_READ_ONLY;
+      }
+    }
+    return DB_SUCCESS;
   }
 
   trx_t *trx = check_trx_exists(current_thd);
@@ -9689,7 +9710,7 @@ dberr_t Fil_system::prepare_open_for_business(bool read_only_mode) {
 
     auto object_id = tablespace.object_id;
 
-    auto moved_prev = tablespace.before_90000;
+    auto moved_prev_or_has_datadir = tablespace.moved_prev_or_has_datadir;
 
     /* We already have the space name in system cs. */
     err = dd_tablespace_rename(object_id, true, space_name.c_str(),
@@ -9711,13 +9732,21 @@ dberr_t Fil_system::prepare_open_for_business(bool read_only_mode) {
     if (Fil_path::has_suffix(IBD, new_path)) {
       /* We want to update the dd_table data dir flag for those ibd files which
       are moved in this restart which is captured in m_moved whose current
-      location is different from where it is originally created. Also,
-      moved_prev is true only when ibd file is moved in previous versions
-      where fpath_old and fpath_new point to newly moved location which is
-      different from default. We want to update dd_table data directory flag
-      as true for this case also. */
-      if ((!moved_prev && !fpath_old.is_dir_same_as(fpath_new)) ||
-          (moved_prev && !MySQL_datadir_path.is_dir_same_as(fpath_new))) {
+      location is different from where it is originally created. */
+      const bool moved_before_restart =
+          !moved_prev_or_has_datadir && !fpath_old.is_dir_same_as(fpath_new);
+
+      /* moved_prev_or_has_datadir is true when ibd file is moved in previous
+      versions where fpath_old and fpath_new point to newly moved location which
+      is different from default. We want to update dd_table data directory flag
+      as true for this case also. It is also true when table is created using
+      data directory clause. We will ignore that case later in
+      dd_update_table_and_partitions_after_dir_change()*/
+      const bool moved_before_upgrade =
+          moved_prev_or_has_datadir &&
+          !MySQL_datadir_path.is_dir_same_as(fpath_new);
+
+      if (moved_before_restart || moved_before_upgrade) {
         err = dd_update_table_and_partitions_after_dir_change(
             object_id, fpath_new.abs_path());
 
@@ -9805,32 +9834,37 @@ bool fil_op_replay_rename_for_ddl(const page_id_t &page_id,
 @param[in]      space_id                Tablespace ID to lookup
 @return true if the space ID is known. */
 bool Fil_system::lookup_for_recovery(space_id_t space_id) {
-  ut_ad(recv_recovery_is_on() || Log_DDL::is_in_recovery());
-
   /* Single threaded code, no need to acquire mutex. */
-  const auto result = get_scanned_filename_by_space_id(space_id);
+  const bool is_known =
+      get_scanned_filename_by_space_id(space_id).second != nullptr;
 
   if (recv_recovery_is_on()) {
-    const auto &end = recv_sys->deleted.end();
-    const auto &it = recv_sys->deleted.find(space_id);
+    /* Simple consistency checks */
+    if (is_known) {
+      /* It could only be in missing_ids if it was added here earlier,
+      because get_scanned_filename_by_space_id has not found it. But it
+      could not be a known space_id now, it would mean something went
+      quite wrong. */
+      ut_a(recv_sys->missing_ids.count(space_id) == 0);
 
-    if (result.second == nullptr) {
-      /* If it wasn't deleted after finding it on disk then
-      we tag it as missing. */
-
-      if (it == end) {
+      /* Every time a space_id is marked deleted, the path
+      is also removed from m_dirs. */
+      ut_a(recv_sys->deleted.count(space_id) == 0);
+    } else {
+      /* Should belong to exactly one of `deleted` or `missing_ids`, as whenever
+      adding to deleted we remove from missing_ids, and
+      we add to missing_ids only if it's not in deleted. */
+      if (recv_sys->deleted.count(space_id) != 0) {
+        ut_a(recv_sys->missing_ids.count(space_id) == 0);
+      } else {
         recv_sys->missing_ids.insert(space_id);
       }
-
-      return false;
     }
-
-    /* Check that it wasn't deleted. */
-
-    return (it == end);
+  } else {
+    ut_a(Log_DDL::is_in_recovery());
   }
 
-  return (result.second != nullptr);
+  return is_known;
 }
 
 /** Lookup the tablespace ID.
@@ -9896,8 +9930,8 @@ dberr_t fil_tablespace_open_for_recovery(space_id_t space_id) {
 Fil_state fil_tablespace_path_equals(space_id_t space_id,
                                      const char *space_name, ulint fsp_flags,
                                      std::string old_path,
-                                     bool data_dir_flag_missing,
                                      std::string *new_path) {
+  ut_a(!recv_recovery_is_on());
   ut_ad((fsp_is_ibd_tablespace(space_id) &&
          Fil_path::has_suffix(IBD, old_path)) ||
         fsp_is_undo_tablespace(space_id));
@@ -9921,9 +9955,6 @@ Fil_state fil_tablespace_path_equals(space_id_t space_id,
     undo::spaces->s_unlock();
   }
 
-  /* Single threaded code, no need to acquire mutex. */
-  const auto &end = recv_sys->deleted.end();
-  const auto &it = recv_sys->deleted.find(space_id);
   const auto result = fil_system->get_scanned_filename_by_space_id(space_id);
 
   if (result.second == nullptr) {
@@ -9944,19 +9975,16 @@ Fil_state fil_tablespace_path_equals(space_id_t space_id,
       return Fil_state::MATCHES;
     }
 
-    /* If it wasn't deleted during redo apply, we tag it as missing. */
-
-    if (it == end && recv_recovery_is_on()) {
-      recv_sys->missing_ids.insert(space_id);
-    }
-
     return Fil_state::MISSING;
   }
 
-  /* Check if it was deleted according to the redo log. */
-  if (it != end) {
-    return Fil_state::DELETED;
-  }
+  /* While we redo the MLOG_FILE_DELETE in the redo log recovery, we are adding
+  the space to the deleted list and we remove it from the tablespace_scanning
+  mapping. A space once deleted, can't be created with the same ID. So we should
+  never reach here with deleted space. We are running in context of threads of
+  DD validation. No one is modifying this data in parallel
+  so it is safe to read it without mutex protection. */
+  ut_a(recv_sys->deleted.count(space_id) == 0);
 
   /* A file with this space_id was found during scanning.
   Validate its location and check if it was moved from where
@@ -10006,17 +10034,17 @@ Fil_state fil_tablespace_path_equals(space_id_t space_id,
   if (old_dir != new_dir) {
     *new_path = result.first + result.second->front();
     return Fil_state::MOVED;
-  } else if (!new_same_as_default && data_dir_flag_missing) {
+  } else if (!new_same_as_default) {
     /* We want to recognize those tables which are moved in previous versions
     and mark the dd_table data dir flag as true as we need to make sure dd_table
-    is in sync with current status of the table. We check if the tablespace is
-    not in default data dir, has ibd extension, if dd_table exists for that
-    table, and the data directory flag doesn't exist (which is true in case
-    table is created using data directory clause, but is not set by some server
-    versions before 9.0.0 when the file is being moved while the server is not
-    running and then it is started). */
+    is in sync with current status of the table. This condition is hit by tables
+    which are moved in previous versions of server before 8.0.38/8.4.1/9.0.0 and
+    the tables which are created using data directory clause as in both cases
+    old dir and new dir will be same but different from default dir. So marking
+    these tables as MOVED_PREV_OR_HAS_DATADIR which is referred later to set the
+    flag */
     *new_path = old_path;
-    return Fil_state::MOVED_PREV;
+    return Fil_state::MOVED_PREV_OR_HAS_DATADIR;
   }
 
   *new_path = old_path;
@@ -10025,10 +10053,11 @@ Fil_state fil_tablespace_path_equals(space_id_t space_id,
 
 void fil_add_moved_space(dd::Object_id dd_object_id, space_id_t space_id,
                          const char *space_name, const std::string &old_path,
-                         const std::string &new_path, bool before_90000) {
+                         const std::string &new_path,
+                         bool moved_prev_or_has_datadir) {
   /* Keep space_name in system cs. We handle it while modifying DD. */
   fil_system->moved(dd_object_id, space_id, space_name, old_path, new_path,
-                    before_90000);
+                    moved_prev_or_has_datadir);
 }
 
 bool fil_update_partition_name(space_id_t space_id, uint32_t fsp_flags,
@@ -10105,20 +10134,21 @@ or MLOG_FILE_RENAME record. These could not be recovered.
         ignore redo log records during the apply phase */
 bool Fil_system::check_missing_tablespaces() {
   bool missing = false;
-  const auto end = recv_sys->deleted.end();
 
   /* Called in single threaded mode, no need to acquire the mutex. */
 
   recv_sys->dblwr->check_missing_tablespaces();
 
   for (auto space_id : recv_sys->missing_ids) {
-    if (recv_sys->deleted.find(space_id) != end) {
-      continue;
-    }
+    /* space_id can't belong to recv_sys->deleted, because whenever we insert
+    an id into it, we remove it from recv_sys->missing_ids, and we insert into
+    recv_sys->missing_ids only if it's not in recv_sys->deleted.
+    No space id should be present in both containers. */
+    ut_a(recv_sys->deleted.count(space_id) == 0);
 
-    const auto result = get_scanned_filename_by_space_id(space_id);
+    const auto result = get_scanned_filename_by_space_id(space_id).second;
 
-    if (result.second == nullptr) {
+    if (result == nullptr) {
       if (fsp_is_undo_tablespace(space_id)) {
         /* This could happen if an undo truncate is in progress because
         undo tablespace construction is not redo logged.  The DD is updated
@@ -10131,7 +10161,7 @@ bool Fil_system::check_missing_tablespaces() {
       missing = true;
 
     } else {
-      ut_a(!result.second->empty());
+      ut_a(!result->empty());
     }
   }
 
@@ -11258,7 +11288,7 @@ static void fil_rename_partition_file(const std::string &old_path,
 
   if (!fil_get_partition_file(old_path, extn, new_path)) {
     ut_d(ut_error);
-    ut_o(return );
+    ut_o(return);
   }
 
   ut_ad(!new_path.empty());
@@ -11298,7 +11328,7 @@ static void fil_rename_partition_file(const std::string &old_path,
   if (!ret) {
     /* File rename failed. */
     ut_d(ut_error);
-    ut_o(return );
+    ut_o(return);
   }
 
   if (import) {
